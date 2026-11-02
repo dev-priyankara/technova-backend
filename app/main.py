@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.database.connection import get_db
 
-from app.routers import categories
+from app.routers import categories, supplier_portal, suppliers
 
 
 app = FastAPI(
@@ -29,6 +29,9 @@ app.add_middleware(
 
 # Register Categories Router
 app.include_router(categories.router)
+app.include_router(suppliers.router)
+app.include_router(supplier_portal.router)
+app.include_router(supplier_portal.branch_router)
 
 
 # Home Endpoint

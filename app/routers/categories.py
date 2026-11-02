@@ -1,3 +1,4 @@
+
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from sqlalchemy import select
@@ -19,9 +20,9 @@ router = APIRouter(
 )
 
 
-# --------------------------------
-# CREATE CATEGORY
-# --------------------------------
+# ==========================================
+# 1. CREATE CATEGORY
+# ==========================================
 
 @router.post(
     "",
@@ -33,6 +34,20 @@ def create_category(
     db: Session = Depends(get_db)
 ):
 
+    # Check whether category name already exists
+    existing_category = db.scalar(
+        select(Category).where(
+            Category.name == category_data.name
+        )
+    )
+
+    if existing_category:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Category name already exists"
+        )
+
+    # Create new category
     new_category = Category(
         name=category_data.name,
         description=category_data.description
@@ -48,16 +63,16 @@ def create_category(
         db.rollback()
 
         raise HTTPException(
-            status_code=409,
+            status_code=status.HTTP_409_CONFLICT,
             detail="Category name already exists"
         )
 
     return new_category
 
 
-# --------------------------------
-# GET ALL CATEGORIES
-# --------------------------------
+# ==========================================
+# 2. GET ALL CATEGORIES
+# ==========================================
 
 @router.get(
     "",
@@ -74,9 +89,9 @@ def get_categories(
     return categories
 
 
-# --------------------------------
-# GET CATEGORY BY ID
-# --------------------------------
+# ==========================================
+# 3. GET CATEGORY BY ID
+# ==========================================
 
 @router.get(
     "/{category_id}",
@@ -91,16 +106,16 @@ def get_category(
 
     if category is None:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Category not found"
         )
 
     return category
 
 
-# --------------------------------
-# UPDATE CATEGORY
-# --------------------------------
+# ==========================================
+# 4. UPDATE CATEGORY
+# ==========================================
 
 @router.put(
     "/{category_id}",
@@ -112,36 +127,83 @@ def update_category(
     db: Session = Depends(get_db)
 ):
 
+    # Find category by ID
     category = db.get(Category, category_id)
 
     if category is None:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Category not found"
         )
 
-    category.name = category_data.name
+    # Get only fields provided in the request
+    update_data = category_data.model_dump(
+        exclude_unset=True
+    )
 
-    category.description = category_data.description
+    # Check whether request body is empty
+    if not update_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please provide at least one field to update"
+        )
 
+    # Update category name if provided
+    if "name" in update_data:
+
+        new_name = update_data["name"]
+
+        # Category name cannot be empty or null
+        if new_name is None or not new_name.strip():
+
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Category name cannot be empty"
+            )
+
+        # Check duplicate category name
+        existing_category = db.scalar(
+            select(Category).where(
+                Category.name == new_name,
+                Category.id != category_id
+            )
+        )
+
+        if existing_category:
+
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Category name already exists"
+            )
+
+        category.name = new_name
+
+    # Update description if provided
+    if "description" in update_data:
+
+        category.description = update_data["description"]
+
+    # Save changes to MySQL
     try:
+
         db.commit()
         db.refresh(category)
 
     except IntegrityError:
+
         db.rollback()
 
         raise HTTPException(
-            status_code=409,
-            detail="Category name already exists"
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Unable to update category due to duplicate data"
         )
 
     return category
 
 
-# --------------------------------
-# DELETE CATEGORY
-# --------------------------------
+# ==========================================
+# 5. DELETE CATEGORY
+# ==========================================
 
 @router.delete("/{category_id}")
 def delete_category(
@@ -149,17 +211,32 @@ def delete_category(
     db: Session = Depends(get_db)
 ):
 
+    # Find category by ID
     category = db.get(Category, category_id)
 
     if category is None:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Category not found"
         )
 
+    # Delete category
     db.delete(category)
-    db.commit()
+
+    try:
+
+        db.commit()
+
+    except IntegrityError:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot delete this category because it is being used by other records"
+        )
 
     return {
-        "message": "Category deleted successfully"
+        "message": "Category deleted successfully",
+        "category_id": category_id
     }
