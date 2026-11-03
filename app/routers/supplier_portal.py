@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.database.connection import get_db
 from app.models.supplier import Supplier
+from app.models.admin import SupplierProfileExtension
 from app.models.supplier_portal import (
     DeliveryDispatch,
     RestockRequest,
@@ -37,16 +38,19 @@ from app.schemas.supplier_portal import (
     SupplierProfileResponse,
     SupplierProfileUpdate,
 )
+from app.security import require_admin, require_supplier_access
 
 
 router = APIRouter(
     prefix="/api/suppliers/{supplier_id}",
     tags=["Supplier Dashboard"],
+    dependencies=[Depends(require_supplier_access)],
 )
 
 branch_router = APIRouter(
     prefix="/api/shop-branches",
     tags=["Shop Branches"],
+    dependencies=[Depends(require_admin)],
 )
 
 
@@ -169,6 +173,7 @@ def get_supplier_profile(
     db: Session = Depends(get_db),
 ):
     supplier = _require_supplier(db, supplier_id)
+    extension = db.get(SupplierProfileExtension, supplier_id)
     return {
         "id": supplier.id,
         "vendor_code": supplier.vendor_code,
@@ -177,15 +182,15 @@ def get_supplier_profile(
         "email": supplier.email,
         "phone": supplier.phone,
         "street": supplier.address,
-        "city": supplier.city,
-        "postal_code": supplier.postal_code,
+        "city": extension.city if extension else None,
+        "postal_code": extension.postal_code if extension else None,
         "tax_id": supplier.tax_id,
         "contract_status": supplier.contract_status,
         "bank_name": supplier.bank_name,
         "bank_branch": supplier.bank_branch,
         "bank_account_no": supplier.bank_account_no,
-        "authorized_brands": supplier.authorized_brands or [],
-        "avatar_url": supplier.avatar_url,
+        "authorized_brands": extension.authorized_brands if extension and extension.authorized_brands else [],
+        "avatar_url": extension.avatar_url if extension else None,
     }
 
 
@@ -215,8 +220,20 @@ def update_supplier_profile(
         supplier.name = company_name
     if "street" in update_data:
         supplier.address = update_data.pop("street")
+    extension_values = {
+        key: update_data.pop(key)
+        for key in ("city", "postal_code", "authorized_brands", "avatar_url")
+        if key in update_data
+    }
     for field, value in update_data.items():
         setattr(supplier, field, value)
+    if extension_values:
+        extension = db.get(SupplierProfileExtension, supplier_id)
+        if extension is None:
+            extension = SupplierProfileExtension(supplier_id=supplier_id)
+            db.add(extension)
+        for field, value in extension_values.items():
+            setattr(extension, field, value)
     try:
         db.commit()
         db.refresh(supplier)

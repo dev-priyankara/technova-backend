@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+import uuid
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -11,11 +12,13 @@ from app.schemas.supplier import (
     SupplierResponse,
     SupplierUpdate,
 )
+from app.security import require_admin
 
 
 router = APIRouter(
     prefix="/api/suppliers",
-    tags=["Suppliers"]
+    tags=["Suppliers"],
+    dependencies=[Depends(require_admin)],
 )
 
 
@@ -38,7 +41,13 @@ def create_supplier(
             detail="Supplier name already exists"
         )
 
-    supplier = Supplier(**supplier_data.model_dump())
+    supplier = Supplier(
+        company_name=supplier_data.name,
+        contact_person=supplier_data.contact_person or supplier_data.name,
+        email=supplier_data.email or f"supplier-{uuid.uuid4().hex}@unassigned.invalid",
+        phone=supplier_data.phone,
+        address=supplier_data.address,
+    )
     db.add(supplier)
 
     try:

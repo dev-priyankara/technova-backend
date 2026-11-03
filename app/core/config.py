@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     DB_NAME: str
 
     FRONTEND_ORIGIN: str = "http://localhost:3000"
+    COOKIE_SECURE: bool = False
 
     model_config = SettingsConfigDict(
         env_file=".env",

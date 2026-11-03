@@ -9,6 +9,8 @@ from sqlalchemy.pool import StaticPool
 from app.database.connection import Base, get_db
 from app.main import app
 from app.models.supplier import Supplier
+from app.models.admin import User
+from app.security import require_admin, require_supplier_access
 
 
 class SupplierDashboardApiTests(unittest.TestCase):
@@ -23,6 +25,8 @@ class SupplierDashboardApiTests(unittest.TestCase):
         self.session_factory = sessionmaker(bind=self.engine)
         self.client = TestClient(app)
         app.dependency_overrides[get_db] = self.override_get_db
+        app.dependency_overrides[require_admin] = self.override_admin
+        app.dependency_overrides[require_supplier_access] = self.override_admin
 
         with self.session_factory() as db:
             supplier = Supplier(
@@ -40,6 +44,8 @@ class SupplierDashboardApiTests(unittest.TestCase):
 
     def tearDown(self):
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(require_admin, None)
+        app.dependency_overrides.pop(require_supplier_access, None)
         Base.metadata.drop_all(self.engine)
         self.engine.dispose()
 
@@ -49,6 +55,16 @@ class SupplierDashboardApiTests(unittest.TestCase):
             yield db
         finally:
             db.close()
+
+    def override_admin(self):
+        return User(
+            id=1,
+            role_id=1,
+            name="Test Admin",
+            email="admin@example.com",
+            password_hash="test",
+            status="Active",
+        )
 
     @property
     def supplier_url(self) -> str:

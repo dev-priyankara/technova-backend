@@ -1,5 +1,9 @@
-from sqlalchemy import JSON, String, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from datetime import datetime
+from decimal import Decimal
+
+from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, func
+from sqlalchemy.dialects.mysql import BIGINT
+from sqlalchemy.orm import Mapped, mapped_column, synonym
 
 from app.database.connection import Base
 
@@ -9,90 +13,34 @@ class Supplier(Base):
     __tablename__ = "suppliers"
 
     id: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True).with_variant(Integer, "sqlite"),
         primary_key=True,
-        autoincrement=True
+        autoincrement=True,
     )
-
-    name: Mapped[str] = mapped_column(
-        String(150),
-        unique=True,
-        nullable=False
-    )
-
-    contact_person: Mapped[str | None] = mapped_column(
-        String(150),
-        nullable=True
-    )
-
-    email: Mapped[str | None] = mapped_column(
-        String(255),
-        nullable=True
-    )
-
-    phone: Mapped[str | None] = mapped_column(
-        String(32),
-        nullable=True
-    )
-
-    address: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True
-    )
-
-    vendor_code: Mapped[str | None] = mapped_column(
-        String(50),
-        unique=True,
-        nullable=True
-    )
-
-    tax_id: Mapped[str | None] = mapped_column(
-        String(100),
-        nullable=True
-    )
-
-    city: Mapped[str | None] = mapped_column(
-        String(100),
-        nullable=True
-    )
-
-    postal_code: Mapped[str | None] = mapped_column(
-        String(20),
-        nullable=True
-    )
-
-    contract_status: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-        default="Under Review"
-    )
-
-    bank_name: Mapped[str | None] = mapped_column(
-        String(150),
-        nullable=True
-    )
-
-    bank_branch: Mapped[str | None] = mapped_column(
-        String(150),
-        nullable=True
-    )
-
-    bank_account_no: Mapped[str | None] = mapped_column(
-        String(100),
-        nullable=True
-    )
-
-    authorized_brands: Mapped[list[str] | None] = mapped_column(
-        JSON,
+    user_id: Mapped[int | None] = mapped_column(
+        BIGINT(unsigned=True).with_variant(Integer, "sqlite"),
+        ForeignKey("users.id"),
         nullable=True,
-        default=list
     )
-
-    avatar_url: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True
+    company_name: Mapped[str] = mapped_column(String(180), nullable=False)
+    name = synonym("company_name")
+    contact_person: Mapped[str] = mapped_column(String(150), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    address: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    tax_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    vendor_code: Mapped[str | None] = mapped_column(String(50), unique=True, nullable=True)
+    rating: Mapped[Decimal | None] = mapped_column(Numeric(3, 2), nullable=True)
+    contract_status: Mapped[str | None] = mapped_column(
+        String(40), nullable=True, default="Under Review"
     )
-
-    notes: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True
+    bank_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    bank_branch: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    bank_account_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    bank_account_no = synonym("bank_account_number")
+    status: Mapped[str] = mapped_column(
+        String(25), nullable=False, default="Active", server_default="Active"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
     )

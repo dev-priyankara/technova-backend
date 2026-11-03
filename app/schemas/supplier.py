@@ -8,7 +8,6 @@ class SupplierCreate(BaseModel):
     email: str | None = Field(default=None, max_length=255)
     phone: str | None = Field(default=None, max_length=32)
     address: str | None = None
-    notes: str | None = None
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -20,7 +19,6 @@ class SupplierUpdate(BaseModel):
     email: str | None = Field(default=None, max_length=255)
     phone: str | None = Field(default=None, max_length=32)
     address: str | None = None
-    notes: str | None = None
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -33,7 +31,6 @@ class SupplierResponse(BaseModel):
     email: str | None
     phone: str | None
     address: str | None
-    notes: str | None
 
     model_config = ConfigDict(from_attributes=True)
 
