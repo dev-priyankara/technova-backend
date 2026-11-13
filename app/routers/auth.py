@@ -1,18 +1,33 @@
 import hashlib
+import logging
+import secrets
+import smtplib
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database.connection import get_db
-from app.models.admin import AuthSession, CustomerAddress, Order, OrderItem, Role, User
+from app.models.admin import (
+    AuthSession,
+    CustomerAddress,
+    Order,
+    OrderItem,
+    PasswordResetCode,
+    Role,
+    User,
+)
 from app.schemas.auth import (
     LoginRequest,
     PasswordUpdateRequest,
+    PasswordResetConfirmRequest,
+    PasswordResetRequest,
     ProfileUpdateRequest,
     RegisterRequest,
 )
+from app.services.email import EmailConfigurationError, send_password_reset_email
 from app.security import (
     CSRF_HEADER,
     CSRF_HEADER_VALUE,
@@ -30,6 +45,16 @@ from app.security import (
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 orders_router = APIRouter(tags=["Orders"])
+logger = logging.getLogger(__name__)
+PASSWORD_RESET_TTL = timedelta(minutes=10)
+PASSWORD_RESET_RESEND_DELAY = timedelta(seconds=60)
+PASSWORD_RESET_MAX_ATTEMPTS = 5
+
+
+def _password_reset_code_hash(user_id: int, code: str, salt: bytes) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256", f"{user_id}:{code}".encode(), salt, 310_000
+    ).hex()
 
 
 def _auth_user_json(db: Session, user: User) -> dict:
@@ -190,7 +215,7 @@ def login(
     db: Session = Depends(get_db),
 ):
     user = db.scalar(
-        select(User).where(func.lower(User.email) == data.email.lower())
+        select(User).where(func.lower(User.email) == data.email.strip().lower())
     )
     if user is None or not verify_password(data.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -199,6 +224,111 @@ def login(
     create_session(db, user, response)
     db.commit()
     return _auth_user_json(db, user)
+
+
+@router.post("/password-reset/request", status_code=status.HTTP_202_ACCEPTED)
+def request_password_reset(
+    data: PasswordResetRequest,
+    db: Session = Depends(get_db),
+):
+    message = {"message": "If that email is registered, a reset code will be sent."}
+    user = db.scalar(
+        select(User).where(
+            func.lower(User.email) == data.email.strip().lower(),
+            User.status == "Active",
+        )
+    )
+    if user is None:
+        return message
+
+    now = utc_now_naive()
+    latest_code = db.scalar(
+        select(PasswordResetCode)
+        .where(
+            PasswordResetCode.user_id == user.id,
+            PasswordResetCode.consumed_at.is_(None),
+        )
+        .order_by(PasswordResetCode.created_at.desc(), PasswordResetCode.id.desc())
+        .limit(1)
+    )
+    if latest_code and latest_code.created_at > now - PASSWORD_RESET_RESEND_DELAY:
+        return message
+
+    db.execute(
+        delete(PasswordResetCode).where(PasswordResetCode.user_id == user.id)
+    )
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    code_salt = secrets.token_bytes(16)
+    reset_code = PasswordResetCode(
+        user_id=user.id,
+        code_hash=_password_reset_code_hash(user.id, code, code_salt),
+        code_salt=code_salt.hex(),
+        expires_at=now + PASSWORD_RESET_TTL,
+    )
+    db.add(reset_code)
+    db.flush()
+
+    try:
+        send_password_reset_email(user.email, user.name, code)
+    except EmailConfigurationError as error:
+        db.rollback()
+        logger.error("Password reset email configuration error: %s", error)
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except (OSError, RuntimeError, smtplib.SMTPException) as error:
+        db.rollback()
+        logger.exception("Unable to send a password reset email")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to send a password reset email. Please try again later.",
+        ) from error
+
+    db.commit()
+    return message
+
+
+@router.post("/password-reset/confirm")
+def confirm_password_reset(
+    data: PasswordResetConfirmRequest,
+    db: Session = Depends(get_db),
+):
+    email = data.email.strip().lower()
+    user = db.scalar(
+        select(User).where(func.lower(User.email) == email, User.status == "Active")
+    )
+    now = utc_now_naive()
+    reset_code = (
+        db.scalar(
+            select(PasswordResetCode)
+            .where(
+                PasswordResetCode.user_id == user.id,
+                PasswordResetCode.consumed_at.is_(None),
+                PasswordResetCode.expires_at > now,
+                PasswordResetCode.attempts < PASSWORD_RESET_MAX_ATTEMPTS,
+            )
+            .order_by(PasswordResetCode.created_at.desc(), PasswordResetCode.id.desc())
+            .limit(1)
+        )
+        if user is not None
+        else None
+    )
+    if reset_code is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+
+    if not secrets.compare_digest(
+        reset_code.code_hash,
+        _password_reset_code_hash(
+            user.id, data.verification_code, bytes.fromhex(reset_code.code_salt)
+        ),
+    ):
+        reset_code.attempts += 1
+        db.commit()
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+
+    user.password_hash = hash_password(data.new_password)
+    reset_code.consumed_at = now
+    revoke_other_sessions(db, user.id, None)
+    db.commit()
+    return {"message": "Password reset successfully. You can now log in."}
 
 
 @router.post("/logout")
@@ -232,6 +362,17 @@ def update_profile(
     user: User = Depends(require_authenticated_user),
 ):
     user.name = data.name
+    if data.email is not None:
+        normalized_email = data.email.strip().lower()
+        existing_user_id = db.scalar(
+            select(User.id).where(
+                func.lower(User.email) == normalized_email,
+                User.id != user.id,
+            )
+        )
+        if existing_user_id is not None:
+            raise HTTPException(status_code=409, detail="Email address is already in use")
+        user.email = normalized_email
     user.phone = data.phone
     address = db.scalar(
         select(CustomerAddress)
@@ -272,8 +413,6 @@ def update_password(
     db: Session = Depends(get_db),
     user: User = Depends(require_authenticated_user),
 ):
-    if not verify_password(data.current_password, user.password_hash):
-        raise HTTPException(status_code=400, detail="Current password is incorrect")
     user.password_hash = hash_password(data.new_password)
     revoke_other_sessions(db, user.id, request.cookies.get(SESSION_COOKIE))
     db.commit()

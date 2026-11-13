@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -9,6 +10,7 @@ from app.database.connection import Base, get_db
 from app.main import app
 from app.models.admin import InventoryTransaction, Role, User
 from app.models.product import Product
+from app.services.email import EmailConfigurationError
 from app.security import hash_password, require_admin, require_authenticated_user
 
 
@@ -155,6 +157,172 @@ class AuthenticationApiTests(unittest.TestCase):
         self.assertEqual(login.json()["role"], "Admin")
         self.assertEqual(self.client.get("/api/admin/profile").status_code, 200)
         self.assertEqual(self.client.get("/api/admin/dashboard").status_code, 200)
+
+    def test_customer_can_update_password_with_confirmation_and_login(self):
+        self.assertEqual(self.register_customer().status_code, 201)
+        headers = {"X-Requested-With": "TECHNOVA"}
+
+        mismatch = self.client.put(
+            "/api/auth/password",
+            headers=headers,
+            json={
+                "new_password": "NewPassword456",
+                "confirm_password": "DifferentPassword456",
+            },
+        )
+        self.assertEqual(mismatch.status_code, 422, mismatch.text)
+
+        updated = self.client.put(
+            "/api/auth/password",
+            headers=headers,
+            json={
+                "new_password": "NewPassword456",
+                "confirm_password": "NewPassword456",
+            },
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+
+        self.client.post("/api/auth/logout", headers=headers)
+        old_password_login = self.client.post(
+            "/api/auth/login",
+            json={"email": "customer@example.com", "password": "SafePassword123"},
+        )
+        self.assertEqual(old_password_login.status_code, 401)
+
+        new_password_login = self.client.post(
+            "/api/auth/login",
+            json={"email": "customer@example.com", "password": "NewPassword456"},
+        )
+        self.assertEqual(new_password_login.status_code, 200, new_password_login.text)
+
+    def test_customer_can_change_email_and_login_with_new_email(self):
+        self.assertEqual(self.register_customer().status_code, 201)
+        updated = self.client.put(
+            "/api/auth/profile",
+            headers={"X-Requested-With": "TECHNOVA"},
+            json={
+                "name": "Customer One",
+                "email": " NewCustomer@example.com ",
+                "phone": "0771234567",
+                "street": "",
+                "city": "",
+                "postal_code": "",
+            },
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(updated.json()["email"], "newcustomer@example.com")
+        password_updated = self.client.put(
+            "/api/auth/password",
+            headers={"X-Requested-With": "TECHNOVA"},
+            json={
+                "new_password": "NewPassword456",
+                "confirm_password": "NewPassword456",
+            },
+        )
+        self.assertEqual(password_updated.status_code, 200, password_updated.text)
+        self.client.post(
+            "/api/auth/logout",
+            headers={"X-Requested-With": "TECHNOVA"},
+        )
+
+        old_email_login = self.client.post(
+            "/api/auth/login",
+            json={"email": "customer@example.com", "password": "SafePassword123"},
+        )
+        self.assertEqual(old_email_login.status_code, 401)
+        old_password_login = self.client.post(
+            "/api/auth/login",
+            json={"email": "newcustomer@example.com", "password": "SafePassword123"},
+        )
+        self.assertEqual(old_password_login.status_code, 401)
+        new_email_login = self.client.post(
+            "/api/auth/login",
+            json={"email": "newcustomer@example.com", "password": "NewPassword456"},
+        )
+        self.assertEqual(new_email_login.status_code, 200, new_email_login.text)
+
+    def test_password_reset_requires_email_code_and_revokes_sessions(self):
+        self.assertEqual(self.register_customer().status_code, 201)
+
+        with patch("app.routers.auth.send_password_reset_email") as send_email:
+            requested = self.client.post(
+                "/api/auth/password-reset/request",
+                json={"email": "CUSTOMER@example.com"},
+            )
+        self.assertEqual(requested.status_code, 202, requested.text)
+        self.assertEqual(
+            requested.json()["message"],
+            "If that email is registered, a reset code will be sent.",
+        )
+        code = send_email.call_args.args[2]
+        self.assertRegex(code, r"^\d{6}$")
+        incorrect_code = f"{(int(code) + 1) % 1_000_000:06d}"
+
+        invalid = self.client.post(
+            "/api/auth/password-reset/confirm",
+            json={
+                "email": "customer@example.com",
+                "verification_code": incorrect_code,
+                "new_password": "NewPassword456",
+                "confirm_password": "NewPassword456",
+            },
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(self.client.get("/api/auth/profile").status_code, 200)
+
+        reset = self.client.post(
+            "/api/auth/password-reset/confirm",
+            json={
+                "email": "customer@example.com",
+                "verification_code": code,
+                "new_password": "NewPassword456",
+                "confirm_password": "NewPassword456",
+            },
+        )
+        self.assertEqual(reset.status_code, 200, reset.text)
+        self.assertEqual(self.client.get("/api/auth/profile").status_code, 401)
+
+        old_password_login = self.client.post(
+            "/api/auth/login",
+            json={"email": "customer@example.com", "password": "SafePassword123"},
+        )
+        self.assertEqual(old_password_login.status_code, 401)
+        new_password_login = self.client.post(
+            "/api/auth/login",
+            json={"email": "customer@example.com", "password": "NewPassword456"},
+        )
+        self.assertEqual(new_password_login.status_code, 200, new_password_login.text)
+
+    def test_password_reset_request_does_not_disclose_unknown_email(self):
+        with patch("app.routers.auth.send_password_reset_email") as send_email:
+            response = self.client.post(
+                "/api/auth/password-reset/request",
+                json={"email": "unknown@example.com"},
+            )
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(
+            response.json()["message"],
+            "If that email is registered, a reset code will be sent.",
+        )
+        send_email.assert_not_called()
+
+    def test_password_reset_reports_missing_email_provider_configuration(self):
+        self.assertEqual(self.register_customer().status_code, 201)
+        with patch(
+            "app.routers.auth.send_password_reset_email",
+            side_effect=EmailConfigurationError(
+                "Password reset email is not configured. Set EMAILJS_SERVICE_ID, "
+                "EMAILJS_TEMPLATE_ID, and EMAILJS_PUBLIC_KEY in the backend "
+                "environment, or configure SMTP."
+            ),
+        ):
+            response = self.client.post(
+                "/api/auth/password-reset/request",
+                json={"email": "customer@example.com"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("Set EMAILJS_SERVICE_ID", response.json()["detail"])
 
     def test_customer_order_uses_database_price_and_updates_stock(self):
         registered = self.register_customer()
