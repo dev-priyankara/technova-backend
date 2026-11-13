@@ -14,6 +14,11 @@ class Settings(BaseSettings):
 
     FRONTEND_ORIGIN: str = "http://localhost:3000"
     COOKIE_SECURE: bool = False
+    # Local development only. When true and no email provider is configured,
+    # password reset codes are written to the server log instead of being
+    # emailed. Codes are still hashed in the database, so this does not weaken
+    # stored data. Never enable it on a shared or public deployment.
+    EMAIL_DEV_MODE: bool = False
     SMTP_HOST: str | None = None
     SMTP_PORT: int = 587
     SMTP_USERNAME: str | None = None

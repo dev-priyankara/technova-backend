@@ -80,9 +80,53 @@ Interactive API docs: <http://127.0.0.1:8000/docs>
 | `DB_NAME`        | *(required)*            | Database name, `technova_db`     |
 | `FRONTEND_ORIGIN`| `http://localhost:3000` | CORS origin and cookie audience  |
 | `COOKIE_SECURE`  | `false`                 | Set `true` behind HTTPS          |
+| `EMAIL_DEV_MODE` | `false`                 | Log reset codes instead of emailing them (local development only) |
 
 Password reset additionally needs either the `EMAILJS_*` variables or the
 `SMTP_*` variables. Without them, reset requests return a configuration error.
+
+### Email without an EmailJS account
+
+Mail is used in two places: registration sends a verification code from the
+browser, and password reset sends a code from the API. For local work you do
+not need either provider.
+
+| Flow                | Setting                                    | What happens locally                        |
+| ------------------- | ------------------------------------------ | ------------------------------------------- |
+| Registration verify | `NEXT_PUBLIC_EMAILJS_*` unset              | No email is sent; the code is shown on the verification screen with an Auto-fill button |
+| Password reset      | `EMAIL_DEV_MODE=true` in `backend/.env`    | No email is sent; the code is written to the API log |
+
+Read a reset code with:
+
+```bash
+grep -A 5 "EMAIL_DEV_MODE" ../.devdata/backend.log | tail -8
+```
+
+`EMAIL_DEV_MODE` is off by default. It must stay off anywhere other than a
+developer machine, because the log becomes a credential. The verification-code
+hint is compiled out of production builds, since it only renders when
+`NODE_ENV` is not `production`.
+
+To send real mail instead, create a free EmailJS account, add an email service
+and a template whose variables are `to_email`, `to_name`, `name`,
+`verification_code` and `expiry_minutes`, then set:
+
+```text
+# backend/.env
+EMAILJS_SERVICE_ID=...
+EMAILJS_TEMPLATE_ID=...
+EMAILJS_PUBLIC_KEY=...
+
+# frontend/.env.local
+NEXT_PUBLIC_EMAILJS_SERVICE_ID=...
+NEXT_PUBLIC_EMAILJS_TEMPLATE_ID=...
+NEXT_PUBLIC_EMAILJS_PUBLIC_KEY=...
+```
+
+SMTP is also supported on the backend via `SMTP_HOST`, `SMTP_PORT`,
+`SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_USE_TLS` and
+`SMTP_USE_SSL`. If `SMTP_HOST` and `SMTP_FROM_EMAIL` are set they take
+precedence over EmailJS.
 
 ## 4. Users
 

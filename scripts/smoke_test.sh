@@ -78,6 +78,18 @@ csrf_code="$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -X POST \
   -d '{"cashier_name":"x","items_count":1,"subtotal":1,"payment_method":"Cash"}')"
 if [ "$csrf_code" = "403" ]; then ok "Write without X-Requested-With is rejected"; else bad "Write without X-Requested-With is rejected (got $csrf_code)"; fi
 
+echo "== Password reset request =="
+reset_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  "$API/api/auth/password-reset/request" -H 'Content-Type: application/json' \
+  -d '{"email":"customer@technova.lk"}')"
+if [ "$reset_code" = "202" ]; then
+  ok "Reset code request accepted"
+elif [ "$reset_code" = "503" ]; then
+  bad "Reset code request rejected: configure EMAILJS_* or SMTP_*, or set EMAIL_DEV_MODE=true"
+else
+  bad "Reset code request (got $reset_code)"
+fi
+
 echo "== Role separation =="
 login "customer@technova.lk" "Technova@123"
 check "Customer can read own orders" 200 GET "$API/api/orders"

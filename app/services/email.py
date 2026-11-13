@@ -1,4 +1,5 @@
 import json
+import logging
 import smtplib
 from email.message import EmailMessage
 from urllib.request import Request, urlopen
@@ -6,8 +7,29 @@ from urllib.request import Request, urlopen
 from app.core.config import settings
 
 
+logger = logging.getLogger(__name__)
+
+
 class EmailConfigurationError(RuntimeError):
     pass
+
+
+def _log_dev_email(to_email: str, name: str, code: str, reason: str) -> None:
+    """Write a reset email to the log instead of sending it.
+
+    Only used when EMAIL_DEV_MODE is enabled, so a developer can exercise the
+    password reset flow without an EmailJS or SMTP account.
+    """
+    logger.warning(
+        "EMAIL_DEV_MODE is on (%s). No email was sent.\n"
+        "    To: %s\n"
+        "    Name: %s\n"
+        "    Reset code: %s (expires in 10 minutes)",
+        reason,
+        to_email,
+        name,
+        code,
+    )
 
 
 def send_password_reset_email(to_email: str, name: str, code: str) -> None:
@@ -43,6 +65,9 @@ def send_password_reset_email(to_email: str, name: str, code: str) -> None:
         settings.EMAILJS_PUBLIC_KEY,
     )
     if not all(emailjs_config):
+        if settings.EMAIL_DEV_MODE:
+            _log_dev_email(to_email, name, code, "no email provider configured")
+            return
         raise EmailConfigurationError(
             "Password reset email is not configured. Set EMAILJS_SERVICE_ID, "
             "EMAILJS_TEMPLATE_ID, and EMAILJS_PUBLIC_KEY in the backend "
