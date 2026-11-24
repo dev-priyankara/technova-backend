@@ -1,7 +1,13 @@
+import os
+import uuid
+from datetime import date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_, select
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
+from fpdf import FPDF
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -10,17 +16,20 @@ from app.models.supplier import Supplier
 from app.models.admin import SupplierProfileExtension
 from app.models.supplier_portal import (
     DeliveryDispatch,
+    Notification,
     RestockRequest,
     RestockRequestItem,
     ReturnedProduct,
     ShopBranch,
     SupplierProduct,
+    SupplierProductSubmission,
 )
 from app.schemas.supplier_portal import (
     DeliveryCreate,
     DeliveryResponse,
     DeliveryStatus,
     DeliveryStatusUpdate,
+    NotificationResponse,
     RestockRequestCreate,
     RestockRequestResponse,
     RestockRequestStatusUpdate,
@@ -37,6 +46,7 @@ from app.schemas.supplier_portal import (
     SupplierProductUpdate,
     SupplierProfileResponse,
     SupplierProfileUpdate,
+    SupplierSubmissionResponse,
 )
 from app.security import require_admin, require_supplier_access
 
@@ -99,6 +109,169 @@ def _stock_status(stock: int) -> str:
     if stock <= 5:
         return "Low Supply"
     return "In Stock"
+
+
+ReportPeriod = Literal["weekly", "monthly"]
+
+
+def _pdf_text(value: object) -> str:
+    """Core PDF fonts only cover Latin-1; replace anything they cannot render."""
+    return str(value if value is not None else "").encode("latin-1", "replace").decode("latin-1")
+
+
+def _fit_pdf_cell(value: object, width: int) -> str:
+    rendered = _pdf_text(value)
+    return rendered if len(rendered) <= width else f"{rendered[: width - 1]}."
+
+
+def _build_delivered_report_pdf(
+    supplier_name: str,
+    period_label: str,
+    start_date: date,
+    end_date: date,
+    rows: list[dict],
+) -> bytes:
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, _pdf_text("TECHNOVA - Delivered Details Report"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, _pdf_text(f"Supplier: {supplier_name}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, _pdf_text(f"Period: {period_label}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        0,
+        6,
+        _pdf_text(f"From {start_date.isoformat()} to {end_date.isoformat()}"),
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+    pdf.cell(
+        0,
+        6,
+        _pdf_text(f"Generated: {datetime.now():%Y-%m-%d %H:%M}"),
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+    pdf.ln(4)
+
+    widths = (40, 34, 40, 34, 40, 30, 16, 33)
+    headings = (
+        "Dispatch No",
+        "Reference",
+        "Destination",
+        "Delivered At",
+        "Carrier",
+        "Waybill",
+        "Units",
+        "Value (Rs.)",
+    )
+    pdf.set_fill_color(15, 23, 42)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 9)
+    for width, heading in zip(widths, headings):
+        pdf.cell(width, 8, _pdf_text(heading), border=1, fill=True)
+    pdf.ln(8)
+
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Helvetica", "", 9)
+    total_units = 0
+    total_value = Decimal("0.00")
+    for row in rows:
+        delivered_at = row.get("delivered_at")
+        delivered_text = (
+            delivered_at.strftime("%Y-%m-%d %H:%M")
+            if hasattr(delivered_at, "strftime")
+            else _pdf_text(delivered_at)
+        )
+        cells = (
+            row.get("dispatch_number"),
+            row.get("reference_no"),
+            row.get("branch_name"),
+            delivered_text,
+            row.get("carrier"),
+            row.get("tracking_number"),
+            row.get("total_units"),
+            f"{Decimal(str(row.get('total_value') or 0)):,.2f}",
+        )
+        for width, value in zip(widths, cells):
+            pdf.cell(width, 7, _fit_pdf_cell(value, width), border=1)
+        pdf.ln(7)
+        total_units += int(row.get("total_units") or 0)
+        total_value += Decimal(str(row.get("total_value") or 0))
+
+    if not rows:
+        pdf.cell(0, 10, _pdf_text("No delivered dispatches in this period."), new_x="LMARGIN", new_y="NEXT")
+
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 8, _pdf_text(f"Total deliveries: {len(rows)}    Total units: {total_units}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 8, _pdf_text(f"Total value: Rs. {total_value:,.2f}"), new_x="LMARGIN", new_y="NEXT")
+    return bytes(pdf.output())
+
+
+@router.get(
+    "/deliveries/report.pdf",
+)
+def get_delivered_details_report(
+    supplier_id: int,
+    period: ReportPeriod = Query(default="weekly"),
+    db: Session = Depends(get_db),
+):
+    supplier = _require_supplier(db, supplier_id)
+    today = date.today()
+    if period == "weekly":
+        start_date = today - timedelta(days=7)
+        period_label = "Weekly (last 7 days)"
+    else:
+        start_date = today.replace(day=1)
+        period_label = "Monthly (current calendar month)"
+
+    rows = db.execute(
+        text(
+            """
+            SELECT d.dispatch_number,
+                   COALESCE(po.po_number, rr.request_number) AS reference_no,
+                   b.name AS branch_name,
+                   d.delivered_at,
+                   d.carrier,
+                   d.tracking_number,
+                   d.total_units,
+                   d.total_value
+            FROM deliveries d
+            LEFT JOIN branches b ON b.id = d.branch_id
+            LEFT JOIN purchase_orders po ON po.id = d.purchase_order_id
+            LEFT JOIN restock_requests rr ON rr.id = d.request_id
+            WHERE d.status = 'Delivered & Verified'
+              AND d.delivered_at >= :start_date
+              AND d.delivered_at < :end_date
+              AND (po.supplier_id = :supplier_id OR rr.supplier_id = :supplier_id)
+            ORDER BY d.delivered_at DESC
+            """
+        ),
+        {
+            "start_date": start_date,
+            "end_date": today + timedelta(days=1),
+            "supplier_id": supplier_id,
+        },
+    ).mappings().all()
+
+    pdf_bytes = _build_delivered_report_pdf(
+        supplier.company_name,
+        period_label,
+        start_date,
+        today,
+        [dict(row) for row in rows],
+    )
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="delivered-details-{period}-{today.isoformat()}.pdf"',
+            "Cache-Control": "private, no-store",
+        },
+    )
 
 
 @router.get(
@@ -736,3 +909,243 @@ def update_return_status(
     db.commit()
     db.refresh(returned_product)
     return returned_product
+
+
+# ---------------------------------------------------------------------------
+# Supplier product submissions (admin approval workflow) & notifications
+# ---------------------------------------------------------------------------
+
+UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads" / "submissions"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _submission_response(db: Session, submission: SupplierProductSubmission) -> dict:
+    supplier = db.get(Supplier, submission.supplier_id)
+    return {
+        "id": submission.id,
+        "supplier_id": submission.supplier_id,
+        "supplier_name": supplier.company_name if supplier else None,
+        "name": submission.name,
+        "brand": submission.brand or "",
+        "category_name": submission.category_name or "",
+        "sku": submission.sku or "",
+        "description": submission.description,
+        "image_url": submission.image_url,
+        "wholesale_price": submission.wholesale_price,
+        "available_stock": submission.available_stock,
+        "warranty_period": submission.warranty_period,
+        "submission_status": submission.submission_status,
+        "rejection_reason": submission.rejection_reason,
+        "admin_selling_price": submission.admin_selling_price,
+        "admin_category_id": submission.admin_category_id,
+        "published_product_id": submission.published_product_id,
+        "submitted_at": submission.submitted_at,
+        "reviewed_at": submission.reviewed_at,
+    }
+
+
+@router.post(
+    "/submissions",
+    response_model=SupplierSubmissionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_supplier_submission(
+    supplier_id: int,
+    name: str = Form(...),
+    brand: str = Form(""),
+    category_name: str = Form(""),
+    sku: str = Form(""),
+    description: str | None = Form(None),
+    wholesale_price: str = Form("0"),
+    available_stock: int = Form(0),
+    warranty_period: str | None = Form(None),
+    image: UploadFile | None = File(None),
+    db: Session = Depends(get_db),
+):
+    _require_supplier(db, supplier_id)
+    image_url = None
+    if image and image.filename:
+        ext = os.path.splitext(image.filename)[1].lower() or ".jpg"
+        if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            raise HTTPException(status_code=422, detail="Image must be jpg, png, webp, or gif")
+        filename = f"{uuid.uuid4().hex}{ext}"
+        dest = UPLOAD_DIR / filename
+        contents = await image.read()
+        if len(contents) > 5 * 1024 * 1024:
+            raise HTTPException(status_code=422, detail="Image must be 5MB or smaller")
+        with open(dest, "wb") as f:
+            f.write(contents)
+        image_url = f"/uploads/submissions/{filename}"
+
+    try:
+        price = Decimal(str(wholesale_price or "0"))
+    except Exception:
+        price = Decimal("0")
+
+    submission = SupplierProductSubmission(
+        supplier_id=supplier_id,
+        name=name.strip(),
+        brand=(brand or "").strip(),
+        category_name=(category_name or "").strip(),
+        sku=(sku or "").strip(),
+        description=(description or "").strip() or None,
+        image_url=image_url,
+        wholesale_price=price,
+        available_stock=max(0, int(available_stock or 0)),
+        warranty_period=(warranty_period or "").strip() or None,
+        submission_status="Pending",
+    )
+    db.add(submission)
+    db.commit()
+    db.refresh(submission)
+    return _submission_response(db, submission)
+
+
+@router.get("/submissions", response_model=list[SupplierSubmissionResponse])
+def list_supplier_submissions(
+    supplier_id: int,
+    status_filter: str | None = Query(default=None, alias="status"),
+    db: Session = Depends(get_db),
+):
+    _require_supplier(db, supplier_id)
+    stmt = select(SupplierProductSubmission).where(
+        SupplierProductSubmission.supplier_id == supplier_id
+    )
+    if status_filter:
+        stmt = stmt.where(SupplierProductSubmission.submission_status == status_filter)
+    submissions = db.scalars(stmt.order_by(SupplierProductSubmission.id.desc())).all()
+    return [_submission_response(db, s) for s in submissions]
+
+
+@router.get("/notifications", response_model=list[NotificationResponse])
+def list_supplier_notifications(
+    supplier_id: int,
+    db: Session = Depends(get_db),
+):
+    supplier = _require_supplier(db, supplier_id)
+    stmt = select(Notification).where(
+        or_(Notification.supplier_id == supplier_id, Notification.user_id == supplier.user_id)
+    ).order_by(Notification.created_at.desc(), Notification.id.desc())
+    return db.scalars(stmt).all()
+
+
+@router.patch("/notifications/{notification_id}/read", response_model=NotificationResponse)
+def mark_notification_read(
+    supplier_id: int,
+    notification_id: int,
+    db: Session = Depends(get_db),
+):
+    supplier = _require_supplier(db, supplier_id)
+    notif = db.scalar(
+        select(Notification).where(
+            Notification.id == notification_id,
+            or_(Notification.supplier_id == supplier_id, Notification.user_id == supplier.user_id),
+        )
+    )
+    if notif is None:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    notif.is_read = True
+    db.commit()
+    db.refresh(notif)
+    return notif
+
+
+@router.get("/me/context")
+def get_supplier_context(
+    supplier_id: int,
+    db: Session = Depends(get_db),
+):
+    supplier = _require_supplier(db, supplier_id)
+    unread = db.scalar(
+        select(func.count()).select_from(Notification).where(
+            or_(Notification.supplier_id == supplier_id, Notification.user_id == supplier.user_id),
+            Notification.is_read.is_(False),
+        )
+    )
+    return {
+        "supplier_id": supplier.id,
+        "company_name": supplier.company_name,
+        "contact_person": supplier.contact_person,
+        "email": supplier.email,
+        "unread_notifications": int(unread or 0),
+    }
+
+
+@router.get("/me/dashboard-summary")
+def get_supplier_dashboard_summary(
+    supplier_id: int,
+    db: Session = Depends(get_db),
+):
+    supplier = _require_supplier(db, supplier_id)
+    extension = db.get(SupplierProfileExtension, supplier_id)
+    unread = db.scalar(
+        select(func.count()).select_from(Notification).where(
+            or_(Notification.supplier_id == supplier_id, Notification.user_id == supplier.user_id),
+            Notification.is_read.is_(False),
+        )
+    )
+    metrics = db.execute(
+        text(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM supplier_products
+                 WHERE supplier_id = :supplier_id) AS products_catalogued,
+                (SELECT COUNT(*) FROM deliveries d
+                 WHERE d.status = 'Delivered & Verified'
+                   AND (
+                     EXISTS (SELECT 1 FROM purchase_orders po
+                             WHERE po.id = d.purchase_order_id
+                               AND po.supplier_id = :supplier_id)
+                     OR EXISTS (SELECT 1 FROM restock_requests rr
+                                WHERE rr.id = d.request_id
+                                  AND rr.supplier_id = :supplier_id)
+                   )) AS deliveries_to_date,
+                (SELECT COALESCE(SUM(d.total_units), 0) FROM deliveries d
+                 WHERE d.status = 'Delivered & Verified'
+                   AND (
+                     EXISTS (SELECT 1 FROM purchase_orders po
+                             WHERE po.id = d.purchase_order_id
+                               AND po.supplier_id = :supplier_id)
+                     OR EXISTS (SELECT 1 FROM restock_requests rr
+                                WHERE rr.id = d.request_id
+                                  AND rr.supplier_id = :supplier_id)
+                   )) AS units_supplied_to_date,
+                (SELECT COALESCE(SUM(d.total_value), 0) FROM deliveries d
+                 WHERE d.status = 'Delivered & Verified'
+                   AND (
+                     EXISTS (SELECT 1 FROM purchase_orders po
+                             WHERE po.id = d.purchase_order_id
+                               AND po.supplier_id = :supplier_id)
+                     OR EXISTS (SELECT 1 FROM restock_requests rr
+                                WHERE rr.id = d.request_id
+                                  AND rr.supplier_id = :supplier_id)
+                   )) AS value_supplied_to_date,
+                (SELECT COUNT(*) FROM product_returns
+                 WHERE supplier_id = :supplier_id) AS returns_to_date,
+                (SELECT COUNT(*) FROM restock_requests
+                 WHERE supplier_id = :supplier_id
+                   AND status = 'Pending Supplier Approval') AS pending_requests
+            """
+        ),
+        {"supplier_id": supplier_id},
+    ).mappings().one()
+
+    return {
+        "supplier_id": supplier.id,
+        "company_name": supplier.company_name,
+        "contact_person": supplier.contact_person,
+        "email": supplier.email,
+        "phone": supplier.phone,
+        "address": supplier.address,
+        "vendor_code": supplier.vendor_code,
+        "rating": float(supplier.rating) if supplier.rating is not None else None,
+        "contract_status": supplier.contract_status,
+        "city": extension.city if extension else None,
+        "unread_notifications": int(unread or 0),
+        "products_catalogued": int(metrics["products_catalogued"]),
+        "deliveries_to_date": int(metrics["deliveries_to_date"]),
+        "units_supplied_to_date": int(metrics["units_supplied_to_date"]),
+        "value_supplied_to_date": float(metrics["value_supplied_to_date"]),
+        "returns_to_date": int(metrics["returns_to_date"]),
+        "pending_requests": int(metrics["pending_requests"]),
+    }

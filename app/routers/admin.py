@@ -3,7 +3,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -27,6 +27,7 @@ from app.models.admin import (
 from app.models.category import Category
 from app.models.product import Product
 from app.models.supplier import Supplier
+from app.models.supplier_portal import Notification, SupplierProductSubmission
 from app.schemas.admin import (
     AIEngineSettingsUpdate,
     AIRecommendationCreate,
@@ -47,10 +48,17 @@ from app.schemas.admin import (
     SavedReportCreate,
     SavedReportUpdate,
 )
+from app.schemas.supplier_portal import (
+    LowStockAlertCreate,
+    NotificationResponse,
+    SubmissionApproveRequest,
+    SubmissionRejectRequest,
+)
 from app.security import (
     SESSION_COOKIE,
     hash_password,
     require_admin,
+    require_authenticated_user,
     require_order_access,
     revoke_other_sessions,
     verify_password,
@@ -1376,3 +1384,335 @@ def delete_saved_report(report_id: int, db: Session = Depends(get_db)):
     db.delete(report)
     db.commit()
     return {"message": "Saved report deleted"}
+
+
+# ---------------------------------------------------------------------------
+# Supplier product submissions review (Page 1 #1 / Page 2 #6)
+# ---------------------------------------------------------------------------
+
+
+def _submission_json(db: Session, submission: SupplierProductSubmission) -> dict:
+    supplier = db.get(Supplier, submission.supplier_id)
+    category = db.get(Category, submission.admin_category_id) if submission.admin_category_id else None
+    return {
+        "id": submission.id,
+        "supplier_id": submission.supplier_id,
+        "supplier_name": supplier.company_name if supplier else None,
+        "supplier_email": supplier.email if supplier else None,
+        "name": submission.name,
+        "brand": submission.brand or "",
+        "category_name": submission.category_name or "",
+        "sku": submission.sku or "",
+        "description": submission.description,
+        "image_url": submission.image_url,
+        "wholesale_price": submission.wholesale_price,
+        "available_stock": submission.available_stock,
+        "warranty_period": submission.warranty_period,
+        "submission_status": submission.submission_status,
+        "rejection_reason": submission.rejection_reason,
+        "admin_selling_price": submission.admin_selling_price,
+        "admin_category_id": submission.admin_category_id,
+        "admin_category_name": category.name if category else None,
+        "published_product_id": submission.published_product_id,
+        "submitted_at": submission.submitted_at,
+        "reviewed_at": submission.reviewed_at,
+    }
+
+
+@router.get("/api/admin/supplier-submissions")
+def list_supplier_submissions(
+    status_filter: str | None = Query(default=None, alias="status"),
+    db: Session = Depends(get_db),
+):
+    stmt = select(SupplierProductSubmission).order_by(SupplierProductSubmission.id.desc())
+    if status_filter:
+        stmt = stmt.where(SupplierProductSubmission.submission_status == status_filter)
+    submissions = db.scalars(stmt).all()
+    return [_submission_json(db, s) for s in submissions]
+
+
+@router.get("/api/admin/supplier-submissions/{submission_id}")
+def get_supplier_submission(submission_id: int, db: Session = Depends(get_db)):
+    submission = db.get(SupplierProductSubmission, submission_id)
+    if submission is None:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    return _submission_json(db, submission)
+
+
+@router.post("/api/admin/supplier-submissions/{submission_id}/approve")
+def approve_supplier_submission(
+    submission_id: int,
+    payload: SubmissionApproveRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    submission = db.get(SupplierProductSubmission, submission_id)
+    if submission is None:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    if submission.submission_status == "Approved":
+        raise HTTPException(status_code=409, detail="Submission is already approved")
+    category = db.get(Category, payload.category_id)
+    if category is None:
+        raise HTTPException(status_code=404, detail="Category not found")
+
+    name = (payload.name or submission.name or "Supplier Product").strip()
+    sku = (payload.sku or submission.sku or f"SUP-{submission.supplier_id}-{submission.id}").strip().upper()
+    description = payload.description if payload.description is not None else submission.description
+    stock_count = submission.available_stock if payload.stock_count is None else payload.stock_count
+
+    # ensure unique SKU for published product
+    existing_sku = db.scalar(select(Product).where(Product.sku == sku))
+    if existing_sku is not None and existing_sku.id != submission.published_product_id:
+        sku = f"{sku}-{submission.id}"
+
+    if submission.published_product_id:
+        product = db.get(Product, submission.published_product_id)
+    else:
+        product = None
+    if product is None:
+        product = Product(
+            name=name,
+            sku=sku,
+            category_id=category.id,
+            description=description,
+            specs=[],
+            cost_price=submission.wholesale_price or Decimal("0.00"),
+            price=payload.selling_price,
+            stock_count=stock_count,
+            min_stock_level=3,
+            warranty=submission.warranty_period,
+            image_url=submission.image_url,
+            status="Active",
+        )
+        db.add(product)
+        db.flush()
+        if stock_count:
+            db.add(
+                InventoryTransaction(
+                    product_id=product.id,
+                    user_id=admin.id,
+                    change_qty=stock_count,
+                    stock_before=0,
+                    stock_after=stock_count,
+                    reason="Supplier submission approved",
+                    reference_type="supplier_submission",
+                    reference_id=submission.id,
+                    notes=f"Published from submission #{submission.id}",
+                )
+            )
+    else:
+        prev_stock = product.stock_count
+        product.name = name
+        product.sku = sku
+        product.category_id = category.id
+        product.description = description
+        product.cost_price = submission.wholesale_price or Decimal("0.00")
+        product.price = payload.selling_price
+        product.stock_count = stock_count
+        product.warranty = submission.warranty_period
+        product.image_url = submission.image_url
+        product.status = "Active"
+        if stock_count != prev_stock:
+            db.add(
+                InventoryTransaction(
+                    product_id=product.id,
+                    user_id=admin.id,
+                    change_qty=stock_count - prev_stock,
+                    stock_before=prev_stock,
+                    stock_after=stock_count,
+                    reason="Supplier submission re-approved",
+                    reference_type="supplier_submission",
+                    reference_id=submission.id,
+                )
+            )
+
+    submission.submission_status = "Approved"
+    submission.rejection_reason = None
+    submission.admin_selling_price = payload.selling_price
+    submission.admin_category_id = category.id
+    submission.published_product_id = product.id
+    submission.reviewed_at = datetime.now()
+    submission.reviewed_by = admin.id
+
+    supplier = db.get(Supplier, submission.supplier_id)
+    if supplier and supplier.user_id:
+        db.add(
+            Notification(
+                user_id=supplier.user_id,
+                supplier_id=supplier.id,
+                type="submission_approved",
+                title="Product submission approved",
+                message=f'Your product "{submission.name}" was approved and published at Rs. {payload.selling_price} under {category.name}.',
+                is_read=False,
+                related_type="supplier_submission",
+                related_id=submission.id,
+            )
+        )
+
+    try:
+        db.commit()
+        db.refresh(submission)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Unable to approve submission (possible SKU conflict)")
+    return _submission_json(db, submission)
+
+
+@router.post("/api/admin/supplier-submissions/{submission_id}/reject")
+def reject_supplier_submission(
+    submission_id: int,
+    payload: SubmissionRejectRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    submission = db.get(SupplierProductSubmission, submission_id)
+    if submission is None:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    if submission.submission_status == "Approved":
+        raise HTTPException(status_code=409, detail="Approved submissions cannot be rejected")
+
+    submission.submission_status = "Rejected"
+    submission.rejection_reason = payload.reason.strip()
+    submission.reviewed_at = datetime.now()
+    submission.reviewed_by = admin.id
+
+    supplier = db.get(Supplier, submission.supplier_id)
+    notified_email = None
+    if supplier and supplier.user_id:
+        db.add(
+            Notification(
+                user_id=supplier.user_id,
+                supplier_id=supplier.id,
+                type="submission_rejected",
+                title="Product submission rejected",
+                message=f'Your product "{submission.name}" was rejected. Reason: {payload.reason.strip()}',
+                is_read=False,
+                related_type="supplier_submission",
+                related_id=submission.id,
+            )
+        )
+        notified_email = supplier.email
+
+    db.commit()
+    db.refresh(submission)
+
+    # Best-effort email notification (do not fail rejection if email is not configured)
+    if notified_email:
+        try:
+            from app.services.email import send_password_reset_email  # not ideal; fallback below
+        except Exception:
+            pass
+        try:
+            # simple SMTP/EmailJS best-effort via generic send if available
+            from app.services import email as email_service
+            if hasattr(email_service, "send_notification_email"):
+                email_service.send_notification_email(
+                    notified_email,
+                    supplier.contact_person if supplier else "Supplier",
+                    "TECHNOVA: Product submission rejected",
+                    f'Your product "{submission.name}" was rejected.\n\nReason: {payload.reason.strip()}',
+                )
+            else:
+                # fallback: try SMTP directly if configured
+                from app.core.config import settings
+                import smtplib
+                from email.message import EmailMessage
+                if settings.SMTP_HOST and settings.SMTP_FROM_EMAIL:
+                    msg = EmailMessage()
+                    msg["Subject"] = "TECHNOVA: Product submission rejected"
+                    msg["From"] = settings.SMTP_FROM_EMAIL
+                    msg["To"] = notified_email
+                    msg.set_content(f'Hello,\n\nYour product "{submission.name}" was rejected.\n\nReason: {payload.reason.strip()}\n')
+                    smtp_class = smtplib.SMTP_SSL if settings.SMTP_USE_SSL else smtplib.SMTP
+                    with smtp_class(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as smtp:
+                        if settings.SMTP_USE_TLS and not settings.SMTP_USE_SSL:
+                            smtp.starttls()
+                        if settings.SMTP_USERNAME and settings.SMTP_PASSWORD:
+                            smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+                        smtp.send_message(msg)
+        except Exception:
+            pass
+
+    return _submission_json(db, submission)
+
+
+@router.post(
+    "/api/admin/low-stock-alerts",
+    response_model=NotificationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def send_low_stock_alert(
+    payload: LowStockAlertCreate,
+    db: Session = Depends(get_db),
+):
+    product = db.get(Product, payload.product_id)
+    if product is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found",
+        )
+    if product.stock_count > product.min_stock_level:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="This product is not currently low on stock",
+        )
+
+    # The local catalogue links products to suppliers through this table.
+    supplier_id = db.execute(
+        text(
+            """
+            SELECT supplier_id
+            FROM supplier_products
+            WHERE product_id = :product_id
+            ORDER BY id
+            LIMIT 1
+            """
+        ),
+        {"product_id": product.id},
+    ).scalar_one_or_none()
+    if supplier_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="No supplier is linked to this product",
+        )
+    supplier = db.get(Supplier, supplier_id)
+    if supplier is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Supplier not found",
+        )
+
+    # Avoid flooding the supplier if the admin clicks more than once.
+    cutoff = datetime.now() - timedelta(hours=24)
+    existing = db.scalar(
+        select(Notification).where(
+            Notification.supplier_id == supplier.id,
+            Notification.type == "low_stock",
+            Notification.related_type == "product",
+            Notification.related_id == product.id,
+            Notification.is_read.is_(False),
+            Notification.created_at >= cutoff,
+        )
+    )
+    if existing is not None:
+        return existing
+
+    default_message = (
+        f"{product.name} (SKU {product.sku}) has {product.stock_count} units left, "
+        f"below the minimum of {product.min_stock_level}. Please arrange a restock."
+    )
+    notification = Notification(
+        user_id=supplier.user_id or 0,
+        supplier_id=supplier.id,
+        type="low_stock",
+        title=f"Low stock alert: {product.name}",
+        message=(payload.message or default_message).strip(),
+        related_type="product",
+        related_id=product.id,
+    )
+    db.add(notification)
+    db.commit()
+    db.refresh(notification)
+    return notification

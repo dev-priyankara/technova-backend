@@ -17,6 +17,7 @@ class ProductCreate(BaseModel):
     stock_count: int = Field(default=0, ge=0)
     min_stock_level: int = Field(default=3, ge=0)
     warranty: str | None = Field(default=None, max_length=150)
+    image_url: str | None = Field(default=None, max_length=500)
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -34,6 +35,7 @@ class ProductUpdate(BaseModel):
     stock_count: int | None = Field(default=None, ge=0)
     min_stock_level: int | None = Field(default=None, ge=0)
     warranty: str | None = Field(default=None, max_length=150)
+    image_url: str | None = Field(default=None, max_length=500)
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -53,6 +55,7 @@ class ProductResponse(BaseModel):
     stock_count: int
     min_stock_level: int
     warranty: str | None
+    image_url: str | None
     status: str
     in_stock: bool
     created_at: datetime

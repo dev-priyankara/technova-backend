@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database.connection import get_db
+from app.models.supplier import Supplier
 from app.models.admin import (
     AuthSession,
     CustomerAddress,
@@ -417,3 +418,21 @@ def update_password(
     revoke_other_sessions(db, user.id, request.cookies.get(SESSION_COOKIE))
     db.commit()
     return {"message": "Password updated successfully"}
+
+
+@router.get("/supplier-context")
+def get_my_supplier_context(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_authenticated_user),
+):
+    supplier = db.scalar(select(Supplier).where(Supplier.user_id == user.id))
+    if supplier is None:
+        raise HTTPException(status_code=404, detail="Supplier account not found for this user")
+    return {
+        "supplier_id": supplier.id,
+        "company_name": supplier.company_name,
+        "contact_person": supplier.contact_person,
+        "email": supplier.email,
+        "phone": supplier.phone,
+        "status": supplier.status,
+    }

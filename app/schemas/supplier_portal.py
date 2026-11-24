@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
@@ -315,3 +315,89 @@ class SupplierOverviewResponse(BaseModel):
     pending_inspections: int
     recent_requests: list[RestockRequestResponse]
     recent_deliveries: list[DeliveryResponse]
+
+
+# ---------------------------------------------------------------------------
+# Supplier product submissions (for admin approval workflow)
+# ---------------------------------------------------------------------------
+
+class SupplierSubmissionCreate(BaseModel):
+
+    name: str = Field(min_length=1, max_length=200)
+    brand: str = Field(default="", max_length=100)
+    category_name: str = Field(default="", max_length=150)
+    sku: str = Field(default="", max_length=100)
+    description: str | None = None
+    wholesale_price: Decimal = Field(default=Decimal("0.00"), ge=0, max_digits=12, decimal_places=2)
+    available_stock: int = Field(default=0, ge=0)
+    warranty_period: str | None = Field(default=None, max_length=150)
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class SupplierSubmissionResponse(BaseModel):
+
+    id: int
+    supplier_id: int
+    supplier_name: str | None = None
+    name: str
+    brand: str
+    category_name: str
+    sku: str
+    description: str | None
+    image_url: str | None
+    wholesale_price: Decimal
+    available_stock: int
+    warranty_period: str | None
+    submission_status: Literal["Pending", "Approved", "Rejected"]
+    rejection_reason: str | None
+    admin_selling_price: Decimal | None
+    admin_category_id: int | None
+    published_product_id: int | None
+    submitted_at: datetime
+    reviewed_at: datetime | None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SubmissionApproveRequest(BaseModel):
+
+    selling_price: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
+    category_id: int = Field(gt=0)
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    sku: str | None = Field(default=None, min_length=1, max_length=100)
+    description: str | None = None
+    stock_count: int | None = Field(default=None, ge=0)
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class SubmissionRejectRequest(BaseModel):
+
+    reason: str = Field(min_length=1, max_length=2000)
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class NotificationResponse(BaseModel):
+
+    id: int
+    user_id: int
+    supplier_id: int | None
+    type: str
+    title: str
+    message: str
+    is_read: bool
+    related_type: str | None
+    related_id: int | None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class LowStockAlertCreate(BaseModel):
+
+    product_id: int
+    message: str | None = Field(default=None, max_length=500)
+
+    model_config = ConfigDict(str_strip_whitespace=True)

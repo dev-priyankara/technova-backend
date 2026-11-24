@@ -15,3 +15,5 @@ htmlcov/
 
 # Local environment overrides
 .env.local
+# Uploaded files
+uploads/

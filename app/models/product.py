@@ -43,6 +43,7 @@ class Product(Base):
         default=3,
     )
     warranty: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     status: Mapped[str] = mapped_column(
         String(8), nullable=False, default="Active", server_default="Active"
     )

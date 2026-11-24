@@ -51,6 +51,7 @@ def _product_response(db: Session, product: Product) -> ProductResponse:
         stock_count=product.stock_count,
         min_stock_level=product.min_stock_level,
         warranty=product.warranty,
+        image_url=product.image_url,
         status=product.status,
         in_stock=product.stock_count > 0,
         created_at=product.created_at,
